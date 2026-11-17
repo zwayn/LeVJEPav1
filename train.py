@@ -2,6 +2,7 @@ import copy
 import functools
 import math
 import os
+import time
 import lightning as pl
 import torch
 import torch._inductor.config
@@ -9,14 +10,16 @@ import stable_pretraining as spt
 from einops import rearrange
 
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from stable_pretraining.backbone.utils import TeacherStudentWrapper
+from stable_pretraining.callbacks.checkpoint_sklearn import find_wandb_logger
 
 import hydra
 from omegaconf import OmegaConf
 
 from data import (Episodes, WindowedLanceDataset, VariableLengthBatchSampler, ViewBuilder, identity_collate, holdout_episodes,
                   holdout_batches, CachedBatches)
+from data_native import NativeVideoDataset, NativeBatchSampler, native_val_batches
 from model import Encoder, Projector
 from loss import SIGReg
 
@@ -25,6 +28,18 @@ from loss import SIGReg
 # token, norms, projector) stays on AdamW. (student\.)?: with an EMA the encoder is wrapped, and its teacher gets no
 # gradient
 MUON_MODULES = r"encoder\.(student\.)?blocks\.\d+\.(attn\.(qkv|proj)|mlp\.(gate|up|down))$"
+
+# spt's Manager reloads the config of the previous offline W&B run on every offline start (wandb.mode=offline), and
+# crashes on a fresh offline run, which has none. Skip it there: main() logs the full config itself.
+_init_and_sync_wandb = spt.Manager.init_and_sync_wandb
+
+def init_and_sync_wandb(self):
+    logger = find_wandb_logger(self._trainer)
+    if logger is not None and logger.experiment.offline is True and self._wandb_previous_dir(logger) is None:
+        return
+    _init_and_sync_wandb(self)
+
+spt.Manager.init_and_sync_wandb = init_and_sync_wandb
 
 def WSD(optimizer, total_steps, peak_step, start_factor=0.01, decay_steps=0, end_factor=0.0):
     """Warmup-stable-decay: linear warmup from start_factor * lr to lr over `peak_step` steps, flat, then the 1-sqrt
@@ -96,19 +111,16 @@ def loss_step(self, batch, split):
 
     batch["loss"] = invariance + self.lam * sig
     if split == "train":
-        self.log_dict({"train/inv": invariance, "train/sig": sig, "train/T": float(globals.shape[1])}, on_step=True, sync_dist=False)
+        self.log_dict({"train/loss": batch["loss"], "train/inv": invariance, "train/sig": sig, "train/T": float(globals.shape[1])},
+                      on_step=True, sync_dist=False)
     else:  # mean over all holdout batches of all ranks, logged once per holdout pass
         self.log_dict({"val/inv": invariance, "val/sig": sig, "val/loss": batch["loss"]}, on_step=False, on_epoch=True, sync_dist=True)
     return batch
 
-@hydra.main(config_path="configs", config_name="config", version_base=None)
-def main(cfg):
-    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
-    world_size = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
-    pl.seed_everything(cfg.seed + rank)
-
+def frame_data(cfg, dataset_cfg, probs, holdout, holdout_length, rank, world_size):
+    """Frame stores (one image per row, data.py): the training dataset and batch sampler, and the holdout's dataset
+    and batches (training videos kept out of training), or None."""
     # a mixture lists its stores under dataset.sources; a single store is a mixture of one
-    dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
     sources = dataset_cfg.pop("sources") if "sources" in dataset_cfg else [dataset_cfg]
     episodes = Episodes(sources)
     dataset = WindowedLanceDataset([s["path"] for s in episodes.sources], episodes.offsets,
@@ -116,16 +128,83 @@ def main(cfg):
                                    column_name=cfg.dataset.get("column", "frame"))
 
     # holdout: `videos` training videos never trained on; their loss is logged as val/* every `every_n_steps` steps
-    holdout = cfg.get("holdout")
-    if holdout is not None:
-        holdout_length = max(int(k) for k in cfg.data.probs)
-        holdout_eps = holdout_episodes(episodes, holdout.videos, holdout_length, seed=cfg.seed)
-
-    sampler = VariableLengthBatchSampler(episodes, batch_size=cfg.data.batch_size,
-                                         probs={int(k): v for k, v in cfg.data.probs.items()},
+    holdout_eps = holdout_episodes(episodes, holdout.videos, holdout_length, seed=cfg.seed) if holdout is not None else None
+    sampler = VariableLengthBatchSampler(episodes, batch_size=cfg.data.batch_size, probs=probs,
                                          batches_per_epoch=cfg.data.batches_per_epoch,
-                                         seed=cfg.seed, rank=rank, world_size=world_size,
-                                         exclude=holdout_eps if holdout is not None else None)
+                                         seed=cfg.seed, rank=rank, world_size=world_size, exclude=holdout_eps)
+    if holdout is None:
+        return dataset, sampler, None, None
+    return dataset, sampler, dataset, holdout_batches(episodes, holdout_eps, holdout_length, cfg.data.batch_size,
+                                                      rank, world_size)
+
+def native_data(cfg, dataset_cfg, probs, holdout, holdout_length, rank, world_size):
+    """Native video stores (one video per row, data_native.py): the training dataset and batch sampler, and the
+    holdout's dataset and batches, or None. The holdout clips come from the store at `val_path` (a separate split, so
+    no training video is held out)."""
+    frames = dict(stride=dataset_cfg.get("stride", 1), sampling=dataset_cfg.get("sampling", "stride"))
+    dataset = NativeVideoDataset(dataset_cfg["path"], height=cfg.data.height, width=cfg.data.width,
+                                 rows_per_take=dataset_cfg.get("rows_per_take", 8))
+    sampler = NativeBatchSampler(dataset.num_frames, batch_size=cfg.data.batch_size, probs=probs,
+                                 batches_per_epoch=cfg.data.batches_per_epoch,
+                                 clips_per_video=dataset_cfg.get("clips_per_video", 1),
+                                 seed=cfg.seed, rank=rank, world_size=world_size, **frames)
+    if holdout is None:
+        return dataset, sampler, None, None
+    assert dataset_cfg.get("val_path"), "holdout on a native store needs dataset.val_path"
+    val_dataset = NativeVideoDataset(dataset_cfg["val_path"], height=cfg.data.height, width=cfg.data.width,
+                                     rows_per_take=dataset_cfg.get("rows_per_take", 8))
+    val_batches = native_val_batches(val_dataset.num_frames, holdout.videos, holdout_length, cfg.data.batch_size,
+                                     seed=cfg.seed, rank=rank, world_size=world_size, **frames)
+    return dataset, sampler, val_dataset, val_batches
+
+class Throughput(Callback):
+    """Logs perf/* every `every_n_steps` training steps, over those steps: clips per second over all ranks, seconds per
+    step, and the fraction of the time spent waiting for the data loader (from the end of one step to the start of the
+    next). Gaps across epoch boundaries and validation passes are left out of both."""
+    def __init__(self, global_batch_size, every_n_steps=50):
+        self.global_batch_size, self.every_n_steps = global_batch_size, every_n_steps
+        self.elapsed, self.wait, self.steps, self.last_end, self.start = 0.0, 0.0, 0, None, None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self.start = time.perf_counter()
+        if self.last_end is not None:
+            self.wait += self.start - self.last_end
+            self.elapsed += self.start - self.last_end
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # sync, or the GPU work still queued would be counted as data wait (costs the CPU running ahead one step)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.last_end = time.perf_counter()
+        self.elapsed += self.last_end - self.start
+        self.steps += 1
+        if self.steps == self.every_n_steps:
+            pl_module.log_dict({"perf/clips_per_s": self.steps * self.global_batch_size / self.elapsed,
+                                "perf/step_s": self.elapsed / self.steps,
+                                "perf/data_wait_frac": self.wait / self.elapsed}, on_step=True, sync_dist=False)
+            self.elapsed, self.wait, self.steps = 0.0, 0.0, 0
+
+    def pause(self, *args):
+        self.last_end = None
+
+    on_train_epoch_start = on_validation_start = pause
+
+@hydra.main(config_path="configs", config_name="config", version_base=None)
+def main(cfg):
+    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
+    world_size = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
+    pl.seed_everything(cfg.seed + rank)
+
+    dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
+    probs = {int(k): v for k, v in cfg.data.probs.items()}
+    holdout = cfg.get("holdout")
+    holdout_length = max(probs)
+    if dataset_cfg.get("format", "frames") == "native":
+        dataset, sampler, val_dataset, val_batches = native_data(cfg, dataset_cfg, probs, holdout, holdout_length,
+                                                                 rank, world_size)
+    else:
+        dataset, sampler, val_dataset, val_batches = frame_data(cfg, dataset_cfg, probs, holdout, holdout_length,
+                                                                rank, world_size)
 
     # forkserver: the holdout decodes lance in this process before the train workers start, and a forked worker would
     # inherit its threads broken
@@ -138,9 +217,8 @@ def main(cfg):
     else:
         # a few fixed batches per rank, decoded once and then served from RAM by the training process; a copy, so the
         # lance handles it opens here are never the ones the train dataset is pickled to its workers with
-        val_loader = torch.utils.data.DataLoader(
-            CachedBatches(copy.copy(dataset)), collate_fn=identity_collate, num_workers=0,
-            batch_sampler=holdout_batches(episodes, holdout_eps, holdout_length, cfg.data.batch_size, rank, world_size))
+        val_loader = torch.utils.data.DataLoader(CachedBatches(copy.copy(val_dataset)), collate_fn=identity_collate,
+                                                 num_workers=0, batch_sampler=val_batches)
         data = spt.data.DataModule(train=train_loader, val=val_loader)
 
     encoder = Encoder(**cfg.model)
@@ -178,6 +256,7 @@ def main(cfg):
     logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
     callbacks = [ModelCheckpoint(**OmegaConf.to_container(cfg.checkpoint, resolve=True))] if "checkpoint" in cfg else []
+    callbacks.append(Throughput(cfg.data.batch_size * world_size))
     val_kwargs = {"val_check_interval": holdout.every_n_steps} if holdout is not None else {}
     trainer = pl.Trainer(**cfg.trainer, **val_kwargs, logger=logger, callbacks=callbacks)
     if cfg.get("gradient_clip_val") is not None:

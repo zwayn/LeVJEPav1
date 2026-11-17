@@ -1,0 +1,11 @@
+# Something-Something v2 as native video stores (data_native.py): one row per video holding every decoded frame at its
+# own size (240 x W, 12 fps, median 45 frames) and the raw AV1 block motion. Data root: $LEVJEPA_DATA_ROOT, or data/
+# under the repository root (on blackwell: LEVJEPA_DATA_ROOT=/data/nvme8tb/zoueinj).
+#   python train.py dataset=ssv2_native
+format: native
+path: ${oc.env:LEVJEPA_DATA_ROOT,data}/ssv2_native/train.lance
+val_path: ${oc.env:LEVJEPA_DATA_ROOT,data}/ssv2_native/validation.lance   # holdout clips (holdout.videos) come from here
+sampling: stride      # stride: T frames `stride` apart from a random start; segment: one frame per T-th of the video
+stride: 4             # 12 fps / 4 = 3 fps, as for SSv2 in configs/dataset/mixture.yaml; short videos repeat their last frame
+clips_per_video: 1    # clips drawn from each video read (a row is ~14 MB, reading it dominates a worker's time)
+rows_per_take: 8      # videos read from Lance at once per worker (bounds worker memory)

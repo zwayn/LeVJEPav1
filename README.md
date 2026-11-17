@@ -130,6 +130,16 @@ uv run python scripts/build_lance_walking_tours.py --workers 16             # CP
 
 Both default to `data/walking_tours/`. To keep the data elsewhere, pass the paths explicitly and set `LEVJEPA_DATA_ROOT=/path/to/data` for training; the store is then read from `$LEVJEPA_DATA_ROOT/walking_tours/train.lance`.
 
+### Native video stores (SSv2)
+
+[data_native.py](data_native.py) also reads *native* stores, which hold one row per video: every decoded frame at its own size as raw `(N, H, W, 3)` uint8 `pixels`, along with the raw AV1 block motion (`motion_vectors`, `reference_map`, `frame_numbers`, `ref_numbers`, not used by pretraining yet). They need no episode index. Each clip's frames are chosen per sample (`sampling: stride` or `segment`) and resized to `data.height x data.width`. The batch is the same as for frame stores. With `holdout` set, the validation clips come from the separate `val_path` store, so no training videos are held out.
+
+```bash
+LEVJEPA_DATA_ROOT=/data/nvme8tb/zoueinj python train.py dataset=ssv2_native "+holdout={videos: 1024, every_n_steps: 1000}"
+```
+
+A row is ~14 MB, so reading dominates. With 16 workers the loader delivers ~370 clips/s of 16 frames (~610 with `dataset.clips_per_video=2`). Every run logs `perf/clips_per_s`, `perf/step_s` and `perf/data_wait_frac` to W&B.
+
 ## Pretraining
 
 ```bash
